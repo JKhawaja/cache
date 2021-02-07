@@ -52,7 +52,6 @@ func TestCacheGet(t *testing.T) {
 	if err != ErrDNE {
 		t.Errorf("should have returned ErrDNE but returned %+v", err)
 	}
-
 }
 
 func TestCacheUpdate(t *testing.T) {

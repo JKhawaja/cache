@@ -6,6 +6,7 @@ import (
 	"errors"
 	"hash/fnv"
 	"io/ioutil"
+	"math"
 	"sync"
 	"time"
 )
@@ -23,13 +24,6 @@ var (
 	defaultRefreshDuration = 1 * time.Second
 )
 
-// Slot is a slot in a cache
-type Slot struct {
-	Item      interface{}
-	ExpiresAt time.Time
-	empty     bool
-}
-
 // Cache is a generic in-memory cache
 type Cache struct {
 	slots   []Slot
@@ -39,16 +33,23 @@ type Cache struct {
 	*sync.Mutex
 }
 
-// OnExpires is a function that will act on the item object
-// of an expired Slot.
-type OnExpires func(item interface{})
-
 // CacheConfig is used to configure a cache
 type CacheConfig struct {
 	OnExpires       OnExpires
 	Refresh         bool // extends key's expiration time on usage (for lru-like behavior)
 	RefreshDuration time.Duration
 	CleanDuration   time.Duration
+}
+
+// OnExpires is a function that will act on the item object
+// of an expired Slot.
+type OnExpires func(item interface{})
+
+// Slot is a slot in a cache
+type Slot struct {
+	Item      interface{}
+	ExpiresAt time.Time
+	empty     bool
 }
 
 // NewCache will create and return a pointer to a new Cache object
@@ -89,54 +90,98 @@ func NewCache(config *CacheConfig) *Cache {
 	return t
 }
 
-// Get will return the value stored at the key.
-// It will return an ErrDNE value if key is not in cache.
-func (t *Cache) Get(key string) (interface{}, error) {
-	hasher := fnv.New64a()
-	_, err := hasher.Write([]byte(key))
-	if err != nil {
-		return nil, err
-	}
-	hashedKey := hasher.Sum64()
-	idx, ok := t.keys[hashedKey]
-	if !ok {
-		return nil, ErrDNE
-	}
+// Add will add a key, value, and expiration duration to the cache.
+// If the key already exists in the collision (i.e. if a collision occurs) then an
+// ErrCollision value will be returned.
+// If you use an expiresIn time of `0` then the item will never be expired from the cache.
+func (t *Cache) Add(key string, item interface{}, expiresIn time.Duration) error {
+	t.Lock()
+	defer t.Unlock()
 
-	item := t.slots[idx]
-	if item.empty {
-		delete(t.keys, hashedKey)
-		return nil, ErrDNE
-	}
-
-	if t.config.Refresh {
-		err := t.Extend(key, t.config.RefreshDuration)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	return item.Item, nil
-}
-
-// Delete will delete a key from the cache.
-// It will return ErrDNE if the key does not exist.
-func (t *Cache) Delete(key string) error {
 	hasher := fnv.New64a()
 	_, err := hasher.Write([]byte(key))
 	if err != nil {
 		return err
 	}
 	hashedKey := hasher.Sum64()
-	idx, ok := t.keys[hashedKey]
-	if !ok {
-		return ErrDNE
+
+	var expiresAt time.Time
+	if expiresIn == 0 {
+		expiresAt = time.Unix(math.MaxInt64, 0)
+	} else {
+		expiresAt = time.Now().UTC().Add(expiresIn)
 	}
 
-	t.slots[idx].empty = true
-	delete(t.keys, hashedKey)
+	return t.add(hashedKey, item, expiresAt)
+}
 
-	return nil
+// Delete will delete a key from the cache.
+// It will return ErrDNE if the key does not exist.
+func (t *Cache) Delete(key string) error {
+	t.Lock()
+	defer t.Unlock()
+
+	hasher := fnv.New64a()
+	_, err := hasher.Write([]byte(key))
+	if err != nil {
+		return err
+	}
+	hashedKey := hasher.Sum64()
+
+	return t.delete(hashedKey)
+}
+
+// Extend will extend the time until expiration for the specified key by the specified duration.
+func (t *Cache) Extend(key string, extend time.Duration) error {
+	t.Lock()
+	defer t.Unlock()
+
+	hasher := fnv.New64a()
+	_, err := hasher.Write([]byte(key))
+	if err != nil {
+		return err
+	}
+	hashedKey := hasher.Sum64()
+
+	return t.extend(hashedKey, extend)
+}
+
+// Get will return the value stored at the key.
+// It will return an ErrDNE value if key is not in cache.
+func (t *Cache) Get(key string) (interface{}, error) {
+	t.Lock()
+	defer t.Unlock()
+
+	hasher := fnv.New64a()
+	_, err := hasher.Write([]byte(key))
+	if err != nil {
+		return nil, err
+	}
+	hashedKey := hasher.Sum64()
+
+	return t.get(hashedKey)
+}
+
+// Load will load an empty cache with the data from
+// the given file. File should contain a gob encoded
+// cached object created via the `Save()` method.
+func (c *Cache) Load(filename string) error {
+	data, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return err
+	}
+
+	return c.gobDecode(data)
+}
+
+// Save will gob-encode and persist the cache
+// in its current state to a file of the given name.
+func (c *Cache) Save(filename string) error {
+	data, err := c.gobEncode()
+	if err != nil {
+		return err
+	}
+	return ioutil.WriteFile(filename, data, 0777)
 }
 
 // Update updates the value at the key to the new supplied value
@@ -148,58 +193,15 @@ func (t *Cache) Update(key string, item interface{}) error {
 	}
 	hashedKey := hasher.Sum64()
 
-	idx, ok := t.keys[hashedKey]
-	if !ok {
-		return ErrDNE
-	}
-
-	t.slots[idx].Item = item
-
-	return nil
+	return t.update(hashedKey, item)
 }
 
-// Extend will extend the time until expiration for the specified key by the specified duration.
-func (t *Cache) Extend(key string, extend time.Duration) error {
-	hasher := fnv.New64a()
-	_, err := hasher.Write([]byte(key))
-	if err != nil {
-		return err
-	}
-	hashedKey := hasher.Sum64()
-
-	idx, ok := t.keys[hashedKey]
-	if !ok {
-		return ErrDNE
-	}
-
-	t.slots[idx].ExpiresAt = t.slots[idx].ExpiresAt.Add(extend)
-
-	if t.nextExp.After(t.slots[idx].ExpiresAt) {
-		t.nextExp = t.slots[idx].ExpiresAt
-	}
-
-	return nil
-}
-
-// Add will add a key, value, and expiration duration to the cache.
-// If the key already exists in the collision (i.e. if a collision occurs) then an
-// ErrCollision value will be returned.
-func (t *Cache) Add(key string, item interface{}, expiresIn time.Duration) error {
-	t.Lock()
-	defer t.Unlock()
-
-	hasher := fnv.New64a()
-	_, err := hasher.Write([]byte(key))
-	if err != nil {
-		return err
-	}
-	hashedKey := hasher.Sum64()
-	_, ok := t.keys[hashedKey]
+func (t *Cache) add(key uint64, item interface{}, expiresAt time.Time) error {
+	_, ok := t.keys[key]
 	if ok {
 		return ErrCollision
 	}
 
-	expiresAt := time.Now().UTC().Add(expiresIn)
 	ts := Slot{
 		Item:      item,
 		ExpiresAt: expiresAt,
@@ -224,7 +226,7 @@ func (t *Cache) Add(key string, item interface{}, expiresIn time.Duration) error
 		t.nextExp = expiresAt
 	}
 
-	t.keys[hashedKey] = idx
+	t.keys[key] = idx
 
 	return nil
 }
@@ -259,27 +261,56 @@ func (t *Cache) clean() []Slot {
 	return expired
 }
 
-// Load --
-func (c *Cache) Load(filename string) error {
-	data, err := ioutil.ReadFile(filename)
-	if err != nil {
-		return err
+func (t *Cache) delete(key uint64) error {
+	idx, ok := t.keys[key]
+	if !ok {
+		return ErrDNE
 	}
 
-	return c.GobDecode(data)
+	t.slots[idx].empty = true
+	delete(t.keys, key)
+
+	return nil
 }
 
-// Save --
-func (c *Cache) Save(filename string) error {
-	data, err := c.GobEncode()
-	if err != nil {
-		return err
+func (t *Cache) extend(key uint64, extend time.Duration) error {
+	idx, ok := t.keys[key]
+	if !ok {
+		return ErrDNE
 	}
-	return ioutil.WriteFile(filename, data, 0777)
+
+	t.slots[idx].ExpiresAt = t.slots[idx].ExpiresAt.Add(extend)
+
+	if t.nextExp.After(t.slots[idx].ExpiresAt) {
+		t.nextExp = t.slots[idx].ExpiresAt
+	}
+
+	return nil
 }
 
-// GobEncode --
-func (c *Cache) GobEncode() ([]byte, error) {
+func (t *Cache) get(key uint64) (interface{}, error) {
+	idx, ok := t.keys[key]
+	if !ok {
+		return nil, ErrDNE
+	}
+
+	item := t.slots[idx]
+	if item.empty {
+		delete(t.keys, key)
+		return nil, ErrDNE
+	}
+
+	if t.config.Refresh {
+		err := t.extend(key, t.config.RefreshDuration)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return item.Item, nil
+}
+
+func (c *Cache) gobEncode() ([]byte, error) {
 	var buff bytes.Buffer
 	e := gob.NewEncoder(&buff)
 	err := e.Encode(c)
@@ -290,8 +321,7 @@ func (c *Cache) GobEncode() ([]byte, error) {
 	return buff.Bytes(), nil
 }
 
-// GobDecode --
-func (c *Cache) GobDecode(data []byte) error {
+func (c *Cache) gobDecode(data []byte) error {
 	var buf bytes.Buffer
 	_, err := buf.Write(data)
 	if err != nil {
@@ -300,4 +330,15 @@ func (c *Cache) GobDecode(data []byte) error {
 
 	d := gob.NewDecoder(&buf)
 	return d.Decode(c)
+}
+
+func (t *Cache) update(key uint64, item interface{}) error {
+	idx, ok := t.keys[key]
+	if !ok {
+		return ErrDNE
+	}
+
+	t.slots[idx].Item = item
+
+	return nil
 }
